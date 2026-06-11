@@ -25,9 +25,33 @@ async function gql(query, variables = {}) {
   return json.data;
 }
 
+// ─── CORS Helper - Handle www and non-www variants ──────────────────────────────
+function getCORSOrigin(requestOrigin) {
+  // If wildcard, allow all
+  if (ALLOWED_ORIGIN === '*') return '*';
+  
+  // Exact match
+  if (requestOrigin === ALLOWED_ORIGIN) return ALLOWED_ORIGIN;
+  
+  // Check www variants
+  const withoutWww = ALLOWED_ORIGIN.replace('https://www.', 'https://');
+  const withWww = ALLOWED_ORIGIN.replace('https://', 'https://www.');
+  
+  if (requestOrigin === withoutWww || requestOrigin === withWww) {
+    return requestOrigin; // Return the actual requesting origin
+  }
+  
+  // Default to ALLOWED_ORIGIN if no match
+  return ALLOWED_ORIGIN;
+}
+
 // ─── Main handler ─────────────────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  // Get the requesting origin
+  const requestOrigin = req.headers.origin || '';
+  const corsOrigin = getCORSOrigin(requestOrigin);
+  
+  res.setHeader('Access-Control-Allow-Origin', corsOrigin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-wishlist-secret');
   res.setHeader('Vary', 'Origin');

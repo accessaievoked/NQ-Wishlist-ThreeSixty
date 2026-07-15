@@ -5,6 +5,48 @@ const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;   // yourstore.myshopify.co
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const API_SECRET = process.env.WISHLIST_API_SECRET || '';
+const BITSPEED_WEBHOOK_URL = process.env.BITSPEED_WEBHOOK_URL || '';
+
+// ─── Bitspeed helpers ──────────────────────────────────────────────────────
+// Bitspeed's customEvents endpoint expects an E.164-ish digit string with
+// country code, e.g. 919876543210 (no +, no spaces, no dashes).
+function formatPhoneForBitspeed(phone) {
+  let digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length === 10) digits = '91' + digits; // assume India if no country code given
+  return digits;
+}
+
+// Fires the Bitspeed customEvents webhook. Never throws — a Bitspeed outage
+// must never break the wishlist add flow for the customer.
+async function notifyBitspeed({ phone, customer_name, product_title, product_handle, added_at }) {
+  if (!BITSPEED_WEBHOOK_URL) return; // not configured yet, skip silently
+
+  const payload = {
+    shopUrl: SHOPIFY_STORE,
+    event: [
+      {
+        phoneNumber: formatPhoneForBitspeed(phone),
+        name: customer_name || '',
+        customField1: product_title || '',
+        customField2: product_handle || '',
+        timestamp: added_at || new Date().toISOString(),
+      },
+    ],
+  };
+
+  try {
+    const res = await fetch(BITSPEED_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      console.error('[Bitspeed] Webhook failed:', res.status, await res.text());
+    }
+  } catch (err) {
+    console.error('[Bitspeed] Webhook error:', err.message);
+  }
+}
 
 // ─── Shopify GraphQL helper ───────────────────────────────────────────────────
 async function gql(query, variables = {}) {
@@ -79,6 +121,7 @@ async function addToWishlist(req, res) {
   const {
     phone, product_id, product_title,
     product_handle, variant_id, product_image, product_price,
+    customer_name,
   } = req.body || {};
 
   if (!phone || !product_id) {
@@ -109,6 +152,7 @@ async function addToWishlist(req, res) {
     {
       fields: [
         { key: 'phone',           value: cleanPhone },
+        { key: 'customer_name',   value: customer_name    || '' },
         { key: 'product_id',      value: String(product_id) },
         { key: 'product_title',   value: product_title   || '' },
         { key: 'product_handle',  value: product_handle  || '' },
@@ -122,6 +166,17 @@ async function addToWishlist(req, res) {
 
   const errors = data.metaobjectCreate.userErrors;
   if (errors.length) return res.status(400).json({ error: errors });
+
+  // Only genuinely NEW wishlist entries reach this point (the alreadyExists
+  // check above returns early for duplicates), so Bitspeed only ever hears
+  // about a phone+product combo once.
+  await notifyBitspeed({
+    phone: cleanPhone,
+    customer_name,
+    product_title,
+    product_handle,
+    added_at: new Date().toISOString(),
+  });
 
   return res.status(201).json({
     success: true,

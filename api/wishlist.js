@@ -162,28 +162,20 @@ async function sendWishlistWhatsApp({ phone, customer_name, product_title, produ
   const firstName = (customer_name || '').trim().split(' ')[0] || 'there';
   const productUrl = STORE_PUBLIC_URL && product_handle
     ? `${STORE_PUBLIC_URL}/products/${product_handle}`
-    : '';
+    : (STORE_PUBLIC_URL || 'your wishlist');
 
+  // Template body has 3 variables, in order: name, product title, product link.
+  // The link is plain text inline in the body — no button component needed.
   const components = [
     {
       type: 'body',
       parameters: [
         { type: 'text', text: firstName },
         { type: 'text', text: product_title || 'your item' },
+        { type: 'text', text: productUrl },
       ],
     },
   ];
-
-  // Only include this if your approved template has a dynamic URL button.
-  // Remove it if the template has no button, or a static (non-dynamic) one.
-  if (productUrl) {
-    components.push({
-      type: 'button',
-      sub_type: 'url',
-      index: 0,
-      parameters: [{ type: 'text', text: productUrl }],
-    });
-  }
 
   const payload = {
     country_code: DEFAULT_COUNTRY_CODE,

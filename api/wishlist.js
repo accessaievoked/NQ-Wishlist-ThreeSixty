@@ -5,48 +5,15 @@ const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;   // yourstore.myshopify.co
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const API_SECRET = process.env.WISHLIST_API_SECRET || '';
-const BITSPEED_WEBHOOK_URL = process.env.BITSPEED_WEBHOOK_URL || '';
 
-// ─── Bitspeed helpers ──────────────────────────────────────────────────────
-// Bitspeed's customEvents endpoint expects an E.164-ish digit string with
-// country code, e.g. 919876543210 (no +, no spaces, no dashes).
-function formatPhoneForBitspeed(phone) {
-  let digits = String(phone || '').replace(/\D/g, '');
-  if (digits.length === 10) digits = '91' + digits; // assume India if no country code given
-  return digits;
-}
-
-// Fires the Bitspeed customEvents webhook. Never throws — a Bitspeed outage
-// must never break the wishlist add flow for the customer.
-async function notifyBitspeed({ phone, customer_name, product_title, product_handle, added_at }) {
-  if (!BITSPEED_WEBHOOK_URL) return; // not configured yet, skip silently
-
-  const payload = {
-    shopUrl: SHOPIFY_STORE,
-    event: [
-      {
-        phoneNumber: formatPhoneForBitspeed(phone),
-        name: customer_name || '',
-        customField1: product_title || '',
-        customField2: product_handle || '',
-        timestamp: added_at || new Date().toISOString(),
-      },
-    ],
-  };
-
-  try {
-    const res = await fetch(BITSPEED_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
-      console.error('[Bitspeed] Webhook failed:', res.status, await res.text());
-    }
-  } catch (err) {
-    console.error('[Bitspeed] Webhook error:', err.message);
-  }
-}
+// ── ConvertWay WhatsApp (instant "added to wishlist" message) ────────────────
+const CONVERTWAY_TOKEN     = process.env.CONVERTWAY_API_TOKEN;
+const CONVERTWAY_ENDPOINT  = 'https://app.theconvertway.com/api/v1/messaging_templates/whatsapp/send_message';
+const TEMPLATE_NAME        = process.env.CONVERTWAY_TEMPLATE_NAME;       // exact Meta-approved name
+const TEMPLATE_LANG        = process.env.CONVERTWAY_TEMPLATE_LANG || 'en';
+const DEFAULT_COUNTRY_CODE = process.env.CONVERTWAY_COUNTRY_CODE || 'IN';
+const DEFAULT_DIAL_CODE    = process.env.DEFAULT_DIAL_CODE || '91';     // used to fix up 10-digit local numbers
+const STORE_PUBLIC_URL     = (process.env.STORE_PUBLIC_URL || '').replace(/\/$/, ''); // e.g. https://claura.in
 
 // ─── Shopify GraphQL helper ───────────────────────────────────────────────────
 async function gql(query, variables = {}) {
@@ -119,9 +86,8 @@ module.exports = async function handler(req, res) {
 // ─── Add to wishlist ──────────────────────────────────────────────────────────
 async function addToWishlist(req, res) {
   const {
-    phone, product_id, product_title,
+    phone, product_id, product_title, customer_name,
     product_handle, variant_id, product_image, product_price,
-    customer_name,
   } = req.body || {};
 
   if (!phone || !product_id) {
@@ -152,7 +118,7 @@ async function addToWishlist(req, res) {
     {
       fields: [
         { key: 'phone',           value: cleanPhone },
-        { key: 'customer_name',   value: customer_name    || '' },
+        { key: 'customer_name',   value: customer_name   || '' },
         { key: 'product_id',      value: String(product_id) },
         { key: 'product_title',   value: product_title   || '' },
         { key: 'product_handle',  value: product_handle  || '' },
@@ -167,21 +133,91 @@ async function addToWishlist(req, res) {
   const errors = data.metaobjectCreate.userErrors;
   if (errors.length) return res.status(400).json({ error: errors });
 
-  // Only genuinely NEW wishlist entries reach this point (the alreadyExists
-  // check above returns early for duplicates), so Bitspeed only ever hears
-  // about a phone+product combo once.
-  await notifyBitspeed({
-    phone: cleanPhone,
-    customer_name,
-    product_title,
-    product_handle,
-    added_at: new Date().toISOString(),
-  });
+  // Fire the instant WhatsApp confirmation. Never let a WhatsApp failure
+  // fail the wishlist add itself — just log it and note it in the response.
+  let whatsapp = { sent: false };
+  try {
+    await sendWishlistWhatsApp({ phone: cleanPhone, customer_name, product_title, product_handle });
+    whatsapp = { sent: true };
+  } catch (err) {
+    console.error('[Wishlist WhatsApp Error]', err.message);
+    whatsapp = { sent: false, error: err.message };
+  }
 
   return res.status(201).json({
     success: true,
     id: data.metaobjectCreate.metaobject.id,
+    whatsapp,
   });
+}
+
+// ─── ConvertWay: instant "added to wishlist" WhatsApp message ────────────────
+async function sendWishlistWhatsApp({ phone, customer_name, product_title, product_handle }) {
+  if (!CONVERTWAY_TOKEN || !TEMPLATE_NAME) {
+    // Not configured yet — skip quietly rather than erroring the whole add.
+    return;
+  }
+
+  const to = toE164NoPlus(phone);
+  const firstName = (customer_name || '').trim().split(' ')[0] || 'there';
+  const productUrl = STORE_PUBLIC_URL && product_handle
+    ? `${STORE_PUBLIC_URL}/products/${product_handle}`
+    : '';
+
+  const components = [
+    {
+      type: 'body',
+      parameters: [
+        { type: 'text', text: firstName },
+        { type: 'text', text: product_title || 'your item' },
+      ],
+    },
+  ];
+
+  // Only include this if your approved template has a dynamic URL button.
+  // Remove it if the template has no button, or a static (non-dynamic) one.
+  if (productUrl) {
+    components.push({
+      type: 'button',
+      sub_type: 'url',
+      index: 0,
+      parameters: [{ type: 'text', text: productUrl }],
+    });
+  }
+
+  const payload = {
+    country_code: DEFAULT_COUNTRY_CODE,
+    messaging_product: 'whatsapp',
+    to,
+    type: 'template',
+    template: {
+      name: TEMPLATE_NAME,
+      language: { code: TEMPLATE_LANG },
+      components,
+    },
+  };
+
+  const res = await fetch(CONVERTWAY_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${CONVERTWAY_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || json.status !== 'SUCCESS') {
+    throw new Error(json.message || `ConvertWay error: HTTP ${res.status}`);
+  }
+  return json;
+}
+
+function toE164NoPlus(rawPhone) {
+  let digits = String(rawPhone || '').replace(/\D/g, '');
+  // 10-digit local number → prefix the default dial code (e.g. 91 for India)
+  if (digits.length === 10) digits = DEFAULT_DIAL_CODE + digits;
+  return digits;
 }
 
 // ─── Get wishlist by phone ────────────────────────────────────────────────────
